@@ -1,0 +1,40 @@
+name: Cartpole
+
+physics_engine: physx
+
+env:
+  numEnvs: 64
+  envSpacing: 2.0
+  episodeLength: 500
+  enableDebugVis: False
+
+  clipObservations: 5.0
+  clipActions: 1.0
+
+  controlFrequencyInv: 2  # 60 Hz control
+
+  # Observations and actions
+  numObservations: 4
+  numActions: 1
+
+sim:
+  dt: 0.0166  # 1/60 s
+  substeps: 2
+  up_axis: "z"
+  use_gpu_pipeline: False  # Set to True for GPU pipeline
+  gravity: [0.0, 0.0, -9.81]
+  
+  physx:
+    num_threads: 4
+    solver_type: 1  # 0: pgs, 1: tgs
+    num_position_iterations: 4
+    num_velocity_iterations: 1
+    contact_offset: 0.02
+    rest_offset: 0.001
+    bounce_threshold_velocity: 0.2
+    max_depenetration_velocity: 100.0
+    default_buffer_size_multiplier: 5.0
+    contact_collection: 0  # 0: CC_NEVER, 1: CC_LAST_SUBSTEP, 2: CC_ALL_SUBSTEPS
+
+task:
+  randomize: False

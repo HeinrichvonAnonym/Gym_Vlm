@@ -1,0 +1,157 @@
+name: MultiFranka
+
+physics_engine: physx
+
+###################### basical gym settings #############################
+sim:
+  dt: 0.0166  # 1/60 s
+  substeps: 2
+  up_axis: "z"
+  use_gpu_pipeline: True  # Set to True for GPU pipeline
+  gravity: [0.0, 0.0, -9.81]
+  
+  physx:
+    num_threads: 4
+    solver_type: 1  # 0: pgs, 1: tgs
+    num_position_iterations: 4
+    num_velocity_iterations: 1
+    contact_offset: 0.02
+    rest_offset: 0.001
+    bounce_threshold_velocity: 0.2
+    max_depenetration_velocity: 100.0
+    default_buffer_size_multiplier: 5.0
+    contact_collection: 0  # 0: CC_NEVER, 1: CC_LAST_SUBSTEP, 2: CC_ALL_SUBSTEPS
+
+task:
+  # not using
+  randomize: False
+  name: "Franka"
+
+
+env:
+  
+  numEnvs: ${resolve_default:4,${...num_envs}}
+  envSpacing: 1.5
+  episodeLength: 300
+  enableDebugVis: False
+
+  num_envs: 4
+
+  clipObservations: 5.0
+  clipActions: 1.0
+
+  startPositionNoise: 0.25
+  startRotationNoise: 0.785
+  frankaPositionNoise: 0.0
+  frankaRotationNoise: 0.0
+  frankaDofNoise: 0.25
+
+  aggregateMode: 3
+
+  actionScale: 1.0
+  distRewardScale: 2.0
+  liftRewardScale: 1.5
+  alignRewardScale: 2.0
+  eefZAlignRewardScale: 0.5
+  stackRewardScale: 16.0
+
+
+##########################################################################
+
+  numRobotsPerEnv: 2
+  numCamsPerEnv: 3
+
+  camWidth: 512
+  camHeight: 512
+
+  camIntrinsics:
+    # Isaacgym required
+    - height: 512
+      width: 512
+      horizontal_fov: 69.4
+      # vertical_fov: 80
+
+    - height: 512
+      width: 512
+      horizontal_fov: 69.4
+      # vertical_fov: 80
+    
+    - height: 512
+      width: 512
+      horizontal_fov: 69.4
+      # vertical_fov: 80
+  
+
+  camPoses:
+    # xyz zyx
+    - [1.5, 0.0, 1.2, 0.0, 0.0, 3.14]
+    - [0.0, 0.0, 2.2, 0.0, 1.56, 0.0]
+    - [-1.5, 0.0, 1.2, 0.0, 0.0, 0.0]
+
+  camRots:
+    # i should calc this in code, will delete this pipeline
+    - [[0, 0, -1], 
+       [-1, 0, 0], 
+       [0, -1, 0]]
+
+    - [[0, -1, 0], 
+       [-1, 0, 0], 
+       [0,  0, -1]]
+
+    - [[0,   0, 1], 
+       [-1,  0, 0], 
+       [0,  -1, 0]]
+  
+  robotOffset:
+    # xyz xyzw
+    - [0.2, 0.6, 0, 0, 0, 0.707, -0.707]
+    - [0.2, -0.6, 0, 0, 0, 0.707, 0.707]
+
+  
+  table:
+    size: [2, 1.5]
+  
+
+  controlType: osc  # options are {joint_tor, osc}
+
+  asset:
+    assetRoot: "../../assets"
+    assetFileNameFranka: "robots/franka_description/robots/franka_panda_gripper.urdf"
+    # "urdf/franka_description/robots/franka_panda_gripper.urdf"
+
+  # set to True if you use camera sensors in the environment
+  enableCameraSensors: true
+
+  objectNames:
+    - "human"
+    - "tool"
+    - "env"
+
+  workspaceBoundsMax: [2.5, 2.5, 5]
+  workspaceBoundsMin: [-2.5, -2.5, 0]
+
+
+agent:
+  # same as Voxposer
+  vlm:
+    name: "VLM"
+    prompt_fname: "planner_prompt"
+    model: gpt-4
+    max_tokens: 512
+    temperature: 0.0
+    query_prefix: '# Query: '
+    query_suffix: '.'
+    stop:
+      - '# Query:'
+      - 'objects = '
+    maintain_session: false
+    include_context: false
+    has_return: false
+    return_val_name: "rel_val"
+    load_cache: true
+
+  controller:
+    horizon_length: 1
+    num_samples: 10000
+
+  
