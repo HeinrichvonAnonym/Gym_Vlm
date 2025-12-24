@@ -1,5 +1,8 @@
-./models/*.*
+models/*.*
+cache/*.*
 *.jpg
 *.jpeg
 *.png
 ./__pycache__
+env/__pycache__
+build

@@ -16,17 +16,17 @@ import cv2
 
 from env.task.vlm_observation import VLM_Observation
 
-from env.task.plc_visualizer import PointCloudVisualizer
+from utils.visualizer import PointCloudVisualizer
 
 from scipy.spatial import transform as trans
 from scipy.spatial.transform import Rotation as R
 
-from segment_anything import SamAutomaticMaskGenerator, sam_model_registry
+from utils.cv_models import DinoSamInterface
 
 import torch.nn.functional as F
 from torchvision.transforms.functional import resize, InterpolationMode
 
-
+from copy import deepcopy
 
 @torch.jit.script
 def axisangle2quat(vec, eps=1e-6):
@@ -115,20 +115,20 @@ class MultiFranka(VecTask):
 
         # Tensor placeholders
         self._root_state = None             # State of root body        (n_envs, 13)
-        self._dof_state = None  # State of all joints       (n_envs, n_dof)
-        self._q = None  # Joint positions           (n_envs, n_dof)
+        self._dof_state = None              # State of all joints       (n_envs, n_dof)
+        self._q = None                      # Joint positions           (n_envs, n_dof)
         self._qd = None                     # Joint velocities          (n_envs, n_dof)
-        self._rigid_body_state = None  # State of all rigid bodies             (n_envs, n_bodies, 13)
-        self._contact_forces = None     # Contact forces in sim
-        self._eef_state = None  # end effector state (at grasping point)
-        self._eef_lf_state = None  # end effector state (at left fingertip)
-        self._eef_rf_state = None  # end effector state (at left fingertip)
-        self._j_eef = None  # Jacobian for end effector
-        self._mm = None  # Mass matrix
-        self._arm_control = None  # Tensor buffer for controlling arm
-        self._gripper_control = None  # Tensor buffer for controlling gripper
-        self._pos_control = None            # Position actions
-        self._effort_control = None         # Torque actions
+        self._rigid_body_state = None       # State of all rigid bodies             (n_envs, n_bodies, 13)
+        self._contact_forces = None         # Contact forces in sim
+        self._eef_states = None              # end effector state (at grasping point)
+        self._eef_lf_states = None           # end effector state (at left fingertip)
+        self._eef_rf_states = None           # end effector state (at left fingertip)
+        self._j_eefs = None                  # Jacobian for end effector
+        self._mms = None                     # Mass matrix
+        self._arm_controls = None            # Tensor buffer for controlling arm
+        self._gripper_controls = None        # Tensor buffer for controlling gripper
+        self._pos_controls = None            # Position actions
+        self._effort_controls = None         # Torque actions
         self._franka_effort_limits = None        # Actuator effort limits for franka
         self._global_indices = None         # Unique indices corresponding to all envs in flattened array
 
@@ -172,29 +172,10 @@ class MultiFranka(VecTask):
             pcl_transform[:3, :3] = self.cam_rots[i]
             pcl_transform[:3, 3] = position        
             self.pcl_transforms.append(pcl_transform)
-        
-        self.init_sam_model()
 
-    def init_sam_model(self):
-        """在DualFranka.__init__中调用此方法"""
-        # 加载模型
-        self.sam_model = sam_model_registry["vit_b"](checkpoint="models/sam_vit_b_01ec64.pth")
-        
-        # 将模型移到GPU
-        self.sam_model.to(device="cuda:0")
-        
-        # 创建mask生成器,使用合理的参数
-        self.sam_generator = SamAutomaticMaskGenerator(
-            model=self.sam_model,
-            points_per_side=32,  # 减少采样点以加快速度
-            pred_iou_thresh=0.86,
-            stability_score_thresh=0.92,
-            crop_n_layers=1,
-            crop_n_points_downscale_factor=2,
-            min_mask_region_area=100,  # 过滤小掩码
-        )
-        
-        print(f"SAM model initialized on {self.device}")
+        self.cv_interface = DinoSamInterface()
+        pass
+
         
     def create_sim(self):
         self.sim_params.up_axis = gymapi.UP_AXIS_Z
@@ -204,7 +185,15 @@ class MultiFranka(VecTask):
         self.sim = super().create_sim(
             self.device_id, self.graphics_device_id, self.physics_engine, self.sim_params)
         self._create_ground_plane()
+
         self._create_envs(self.num_envs, self.cfg["env"]['envSpacing'], int(np.sqrt(self.num_envs)))
+        # 主光源
+        self.gym.set_light_parameters(
+            self.sim, 0,
+            gymapi.Vec3(1., 1., 1.),      # 强白光
+            gymapi.Vec3(0.6, 0.6, 0.61),      # 弱环境光
+            gymapi.Vec3(-0.5, -0.5, -1.0)
+        )
 
     def _create_ground_plane(self):
         plane_params = gymapi.PlaneParams()
@@ -221,6 +210,18 @@ class MultiFranka(VecTask):
         table_width = self.table_parmas["size"][1]
         self.table_asset = self.gym.create_box(self.sim, *[table_length, table_width, self.table_thickness], self.table_opts)
     
+    def load_carpet_asset(self):
+        self.carpet_pos = [0.0, 0.0, 0.0]
+        self.carpet_thickess = 0.005
+        self.carpet_opts = gymapi.AssetOptions()
+        self.carpet_opts.fix_base_link = True
+        self.carpet_asset = self.gym.create_box(self.sim, 
+                                    *[
+                                        0.8 * (self.workspace_bounds_max[0] - self.workspace_bounds_min[0]),
+                                        0.8 * (self.workspace_bounds_max[1] - self.workspace_bounds_min[1]), 
+                                        self.carpet_thickess],
+                                    self.carpet_opts)
+    
     def load_stand_asset(self):
         # Create robot stand asset
         self.table_stand_height = 0.05
@@ -229,6 +230,15 @@ class MultiFranka(VecTask):
         self.table_stand_opts.fix_base_link = True
         self.table_stand_asset = self.gym.create_box(self.sim, *[0.3, 0.3, self.table_stand_height], self.table_opts)
 
+    def load_wall_asset(self):
+        self.wall_thickness = 0.1
+        self.wall_opts = gymapi.AssetOptions()
+        self.wall_opts.fix_base_link = True
+        self.wall_asset = self.gym.create_box(self.sim, 
+                            *[0.8 * (self.workspace_bounds_max[0] - self.workspace_bounds_min[0]), 
+                              self.wall_thickness, 
+                              4], 
+                              self.wall_opts)
     
     def load_robot_asset(self):
         asset_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../assets")
@@ -334,6 +344,66 @@ class MultiFranka(VecTask):
         human_asset = self.gym.load_asset(self.sim, human_asset_root, human_asset_file, human_asset_options)
         self.human_asset = human_asset
 
+    def create_carpet(self, env_ptr, index):
+        pose = gymapi.Transform()
+        pose.p = gymapi.Vec3(0.0, 0.0, 0.3)
+        self.carpet_handle = self.gym.create_actor(env_ptr, self.carpet_asset, pose, "carpet", index, 0, 0)
+        self.gym.set_rigid_body_color(env_ptr, self.carpet_handle, 0, 
+                            gymapi.MESH_VISUAL, gymapi.Vec3(0.25, 0.35, 0.3))
+        self.num_stable_aware_per_env += 1
+
+    def create_walls(self, env_ptr, index):
+        color = gymapi.Vec3(0.65, 0.65, 0.6)
+        
+        pose_1 = gymapi.Transform()
+        pose_1.p.x = 0.5 * self.wall_thickness
+        pose_1.p.y = 0.8 * self.workspace_bounds_min[0]
+        pose_1.p.z = 1
+        self.wall_1_handle = self.gym.create_actor(env_ptr, self.wall_asset, 
+                                                 pose_1, "wall_1", index, 0, 0)
+        # color
+        self.gym.set_rigid_body_color(env_ptr, self.wall_1_handle, 0, 
+                                gymapi.MESH_VISUAL, color)
+        
+        pose_2 = gymapi.Transform()
+        pose_2.p.x = 0.8 * self.workspace_bounds_min[0]
+        pose_2.p.y = - 0.5 * self.wall_thickness
+        pose_2.p.z = 1.
+        pose_2.r.z = 0.707
+        pose_2.r.w = 0.707
+        self.wall_2_handle = self.gym.create_actor(env_ptr, self.wall_asset, 
+                                                 pose_2, "wall_2", index, 0, 0)
+    
+        self.gym.set_rigid_body_color(env_ptr, self.wall_2_handle, 0, 
+                                gymapi.MESH_VISUAL, color)
+        
+        pose_3 = gymapi.Transform()
+        pose_3.p.x = - 0.5 * self.wall_thickness
+        pose_3.p.y = 0.8 * self.workspace_bounds_max[0]
+        pose_3.p.z = 1.
+        self.wall_3_handle = self.gym.create_actor(env_ptr, self.wall_asset, 
+                                                 pose_3, "wall_3", index, 0, 0)
+        
+        self.gym.set_rigid_body_color(env_ptr, self.wall_3_handle, 0, 
+                                gymapi.MESH_VISUAL, color)
+        
+
+        pose_4 = gymapi.Transform()
+        pose_4.p.x = 0.8 * self.workspace_bounds_max[0]
+        pose_4.p.y = 0.5 * self.wall_thickness
+        pose_4.p.z = 1.
+        pose_4.r.z = 0.707
+        pose_4.r.w = 0.707
+        self.wall_4_handle = self.gym.create_actor(env_ptr, self.wall_asset, 
+                                                 pose_4, "wall_4", index, 0, 0)
+        
+        self.gym.set_rigid_body_color(env_ptr, self.wall_4_handle, 0, 
+                                gymapi.MESH_VISUAL, color)
+
+
+        
+        self.num_stable_aware_per_env += 4
+
     def create_robot(self, env_ptr, index):
         for i in range(self.num_robots_per_env):
             """
@@ -370,6 +440,18 @@ class MultiFranka(VecTask):
     
     def create_table(self, env_ptr, index):
         table_actor = self.gym.create_actor(env_ptr, self.table_asset, self.table_start_pose, "table", index, 0, 0)
+        # set color for table
+        # 改变桌子颜色
+        num_bodies = self.gym.get_actor_rigid_body_count(env_ptr, table_actor)
+        
+        for body_idx in range(num_bodies):
+            self.gym.set_rigid_body_color(
+                env_ptr, 
+                table_actor, 
+                body_idx, 
+                gymapi.MESH_VISUAL,
+                gymapi.Vec3(0.55, 0.35, 0.25)  # 
+            )
         self.num_stable_aware_per_env += 1
     
     def create_stand(self, env_ptr, index):
@@ -393,8 +475,13 @@ class MultiFranka(VecTask):
             self.num_stable_aware_per_env += 1
         
     def create_human(self, env_ptr, index):
-        humanoid_actor = self.gym.create_actor(env_ptr, self.human_asset, self.human_start_pose, "human", index, 0,  0)
-            
+
+        if index % 2 != 0:
+            human_pose = deepcopy(self.human_start_pose)
+            human_pose.p.z = 0.1
+            humanoid_actor = self.gym.create_actor(env_ptr, self.human_asset, human_pose, "human", index, 0,  0)
+        else:
+            humanoid_actor = self.gym.create_actor(env_ptr, self.human_asset, self.human_start_pose, "human", index, 0,  0)
         # **关键：设置人形的DOF属性，确保所有关节都是被动的**
         self.human_dof_props = self.gym.get_actor_dof_properties(env_ptr, humanoid_actor)
         num_human_dofs = self.gym.get_actor_dof_count(env_ptr, humanoid_actor)
@@ -423,12 +510,40 @@ class MultiFranka(VecTask):
             human_dof_states, 
             gymapi.STATE_ALL
         )
+
+        num_bodies = self.gym.get_actor_rigid_body_count(env_ptr, humanoid_actor)
+        color = gymapi.Vec3(0.7, 0.6, 0.5)
+        for body_idx in range(num_bodies):
+            # rand in 0, 0.2
+            rand_color = gymapi.Vec3(np.random.uniform(0, 0.05), 
+                                     np.random.uniform(0, 0.05), 
+                                     np.random.uniform(0, 0.05))
+            self.gym.set_rigid_body_color(
+                env_ptr, 
+                humanoid_actor, 
+                body_idx, 
+                gymapi.MESH_VISUAL,  # 或 gymapi.MESH_VISUAL_AND_COLLISION
+                color + rand_color  # RGB: 红色 (R, G, B) 范围 0.0-1.0
+            )
+    
         # **可选：设置人形刚体属性，使其质量分布更真实**
         human_body_props = self.gym.get_actor_rigid_body_properties(env_ptr, humanoid_actor)
         for body_idx in range(len(human_body_props)):
             # 降低质量可以减少动力学影响
             human_body_props[body_idx].mass *= 0.5
+
         self.gym.set_actor_rigid_body_properties(env_ptr, humanoid_actor, human_body_props)
+        
+        # 使用 RigidShapeProperties
+        human_shape_props = self.gym.get_actor_rigid_shape_properties(env_ptr, humanoid_actor)
+
+        for shape_idx in range(len(human_shape_props)):
+            human_shape_props[shape_idx].compliance = 0.05
+            human_shape_props[shape_idx].friction = 0.8
+            human_shape_props[shape_idx].restitution = 0.2
+            human_shape_props[shape_idx].thickness = 0.02
+
+        self.gym.set_actor_rigid_shape_properties(env_ptr, humanoid_actor, human_shape_props)
         
         # 存储人形句柄（如果需要后续访问）
         if not hasattr(self, 'humanoids'):
@@ -478,11 +593,12 @@ class MultiFranka(VecTask):
         self.lower = gymapi.Vec3(float(x_low), float(y_low), float(z_low))
         self.upper = gymapi.Vec3(float(x_high), float(y_high), float(z_high))
 
-        self.num_stable_aware_per_env  = 0
-        self.num_humanoid_per_env = 0
+        
 
         self.load_table_asset()
         self.load_stand_asset()
+        self.load_carpet_asset()
+        self.load_wall_asset()
         self.load_robot_asset()
         self.load_humanoid()
 
@@ -492,6 +608,11 @@ class MultiFranka(VecTask):
         self.cameras = []
         # Create environments
         for i in range(self.num_envs):
+
+            self.num_stable_aware_per_env  = 0
+            self.num_humanoid_per_env = 0
+
+
             # create env instance
             env_ptr = self.gym.create_env(self.sim, self.lower, self.upper, num_per_row)
 
@@ -512,6 +633,10 @@ class MultiFranka(VecTask):
             # # Create Humanoid #####
             self.create_human(env_ptr, i)
 
+            self.create_carpet(env_ptr, i)
+
+            self.create_walls(env_ptr, i)
+
             # create cameras
             self.create_cameras(env_ptr, i)
 
@@ -526,10 +651,15 @@ class MultiFranka(VecTask):
 
     def init_basical_tensors(self):
         # Setup tensor buffers
+        actors_per_env = (
+            self.num_robots_per_env           # franka
+            + self.num_stable_aware_per_env   # table + stand + carpet
+            + self.num_humanoid_per_env       # human
+            )
         _actor_root_state_tensor = self.gym.acquire_actor_root_state_tensor(self.sim)
         _dof_state_tensor = self.gym.acquire_dof_state_tensor(self.sim)
         _rigid_body_state_tensor = self.gym.acquire_rigid_body_state_tensor(self.sim)
-        self._root_state = gymtorch.wrap_tensor(_actor_root_state_tensor).view(self.num_envs, -1, 13)
+        self._root_state = gymtorch.wrap_tensor(_actor_root_state_tensor).view(self.num_envs, actors_per_env, 13)
         self._dof_state = gymtorch.wrap_tensor(_dof_state_tensor).view(self.num_envs, -1, 2)
         self._rigid_body_state = gymtorch.wrap_tensor(_rigid_body_state_tensor).view(self.num_envs, -1, 13)
         self._q = self._dof_state[:,:self.num_robots_per_env * 9, 0]
@@ -672,7 +802,7 @@ class MultiFranka(VecTask):
         # Overwrite gripper init pos (no noise since these are always position controlled)
         pos[:, -2:] = self.franka_default_dof_pos[-2:]
 
-        # Reset the internal obs accordingly
+        # 一次性重置所有机器人的状态
         for i in range(self.num_robots_per_env):
             start_dof = i * 9
             end_dof = (i + 1) * 9
@@ -680,24 +810,40 @@ class MultiFranka(VecTask):
             self._qd[env_ids, start_dof:end_dof] = torch.zeros_like(self._qd[env_ids, start_dof:end_dof])
 
             # Set any position control to the current position, and any vel / effort control to be 0
-            # NOTE: Task takes care of actually propagating these controls in sim using the SimActions API
             self._pos_control[env_ids, start_dof:end_dof] = pos
             self._effort_control[env_ids, start_dof:end_dof] = torch.zeros_like(pos)
 
-            # Deploy updates
-            multi_env_ids_int32 = self._global_indices[env_ids, i].flatten()
-            self.gym.set_dof_position_target_tensor_indexed(self.sim,
-                                                            gymtorch.unwrap_tensor(self._pos_control),
-                                                            gymtorch.unwrap_tensor(multi_env_ids_int32),
-                                                            len(multi_env_ids_int32))
-            self.gym.set_dof_actuation_force_tensor_indexed(self.sim,
-                                                            gymtorch.unwrap_tensor(self._effort_control),
-                                                            gymtorch.unwrap_tensor(multi_env_ids_int32),
-                                                            len(multi_env_ids_int32))
-            self.gym.set_dof_state_tensor_indexed(self.sim,
-                                                gymtorch.unwrap_tensor(self._dof_state),
-                                                gymtorch.unwrap_tensor(multi_env_ids_int32),
-                                                len(multi_env_ids_int32))
+        # 关键修复:只调用一次,使用正确的actor索引
+        # 假设每个环境的前 num_robots_per_env 个actor是机器人
+        franka_indices = []
+        for env_id in env_ids:
+            for robot_idx in range(self.num_robots_per_env):
+                # 每个环境中机器人的actor索引
+                franka_indices.append(self._global_indices[env_id, robot_idx])
+        
+        franka_indices_int32 = torch.tensor(franka_indices, dtype=torch.int32, device=self.device)
+
+        # 一次性设置所有需要重置的机器人
+        self.gym.set_dof_position_target_tensor_indexed(
+            self.sim,
+            gymtorch.unwrap_tensor(self._pos_control),
+            gymtorch.unwrap_tensor(franka_indices_int32),
+            len(franka_indices_int32)
+        )
+        
+        self.gym.set_dof_actuation_force_tensor_indexed(
+            self.sim,
+            gymtorch.unwrap_tensor(self._effort_control),
+            gymtorch.unwrap_tensor(franka_indices_int32),
+            len(franka_indices_int32)
+        )
+        
+        self.gym.set_dof_state_tensor_indexed(
+            self.sim,
+            gymtorch.unwrap_tensor(self._dof_state),
+            gymtorch.unwrap_tensor(franka_indices_int32),
+            len(franka_indices_int32)
+        )
 
         self.progress_buf[env_ids] = 0
         self.reset_buf[env_ids] = 0
@@ -796,8 +942,8 @@ class MultiFranka(VecTask):
         rgb_image = rgb_image.reshape(self.cam_height, self.cam_width, 4)
         rgb_bgr = cv2.cvtColor(rgb_image, cv2.COLOR_RGBA2BGR)
 
-        cam_masks = self.get_obj_masks(rgb_image)
-        self.cam_masks.append(cam_masks)
+        # cam_masks = self.get_obj_masks(rgb_image)
+        # self.cam_masks.append(cam_masks)
 
         depth_image = self.gym.get_camera_image(self.sim, self.envs[0], self.cameras[idx], gymapi.IMAGE_DEPTH)
         depth_image = depth_image.reshape(self.cam_height, self.cam_width) * -1
@@ -813,7 +959,7 @@ class MultiFranka(VecTask):
         points_arr = np.array(points).reshape(-1, 3)
         normals_arr = np.array(normals).reshape(-1, 3)
 
-        self.vlm_obs.cam_rgb[idx] = rgb_image[:, :, :3]
+        self.vlm_obs.cam_rgb[idx] = rgb_image
         self.vlm_obs.cam_depth[idx] = depth_image
         self.vlm_obs.cam_point_cloud[idx] = points_arr
 
@@ -823,44 +969,13 @@ class MultiFranka(VecTask):
             cv2.imshow(f"Depth Heatmap{idx}", depth_heatmap)
             cv2.waitKey(1)
             self.pcl_visualizers[idx].update(pcl)
-            if cam_masks:
-                mask_visualization = visualize_masks_opencv(cam_masks, rgb_image, idx)
-                cv2.imshow(f"SAM Masks Camera {idx}", mask_visualization)
+            # if cam_masks:
+            #     mask_visualization = visualize_masks_opencv(cam_masks, rgb_image, idx)
+            #     cv2.imshow(f"SAM Masks Camera {idx}", mask_visualization)
 
-    def get_obj_masks(self, rgb_raw: np.ndarray):
-        """
-        使用SAM生成对象掩码
-        
-        Args:
-            rgb_raw: [H, W, 4] 或 [H, W, 3] 的numpy数组
-        
-        Returns:
-            masks: SAM生成的掩码列表
-        """
-        # 确保是RGB三通道
-        if rgb_raw.shape[2] == 4:
-            rgb_np = rgb_raw[:, :, :3]
-        else:
-            rgb_np = rgb_raw.copy()
-        
-        # SAM需要uint8格式的[H, W, 3]图像
-        if rgb_np.dtype != np.uint8:
-            if rgb_np.max() <= 1.0:
-                rgb_np = (rgb_np * 255).astype(np.uint8)
-            else:
-                rgb_np = rgb_np.astype(np.uint8)
-        
-        try:
-            # 直接传入numpy数组,SAM会自动处理
-            print(f"Generating masks for image shape: {rgb_np.shape}")
-            masks = self.sam_generator.generate(rgb_np)
-            print(f"Generated {len(masks)} masks")
-            return masks
-        
-        except Exception as e:
-            print(f"Error generating masks: {e}")
-            return []
-
+    def get_obj_masks(self, rgb_raw: np.ndarray, text_prompt: str):
+        return self.cv_interface.detect_and_segment(rgb_raw,
+                                                   text_prompt)
     # def process_rgb(self, rgb, obj_name):
     #     mask = np.zeros_like(rgb[:, :, 0])
     #     mask[:, :] = 1
@@ -978,48 +1093,3 @@ def get_pcl(rgb: np.ndarray, depth: np.ndarray, mask: np.ndarray=None,
 
     return pcl
 
-def visualize_masks_opencv(masks, rgb_image, idx):
-    """
-    使用OpenCV显示SAM生成的掩码（适合你的现有可视化流程）
-    """
-    import cv2
-    import numpy as np
-    
-    if not masks:
-        print(f"Camera {idx}: No masks generated")
-        return rgb_image[:, :, :3]  # 返回原始图像
-    
-    # 创建一个彩色掩码可视化
-    mask_overlay = np.zeros_like(rgb_image[:, :, :3])
-    
-    # 为每个掩码分配不同的颜色
-    colors = [
-        (255, 0, 0),    # 红色
-        (0, 255, 0),    # 绿色
-        (0, 0, 255),    # 蓝色
-        (255, 255, 0),  # 青色
-        (255, 0, 255),  # 洋红
-        (0, 255, 255),  # 黄色
-    ]
-    
-    # 绘制所有掩码
-    for i, mask_data in enumerate(masks[:6]):  # 最多显示6个掩码
-        mask = mask_data['segmentation']
-        color = colors[i % len(colors)]
-        mask_overlay[mask] = color
-    
-    # 将掩码叠加到原始图像上（50%透明度）
-    alpha = 0.5
-    result = cv2.addWeighted(rgb_image[:, :, :3], 1 - alpha, mask_overlay, alpha, 0)
-    
-    # 在图像上添加文本信息
-    cv2.putText(result, f'Masks: {len(masks)}', (10, 30), 
-                cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-    
-    # 显示得分最高的掩码信息
-    if masks:
-        best_mask = max(masks, key=lambda x: x['predicted_iou'])
-        cv2.putText(result, f'Best IOU: {best_mask["predicted_iou"]:.2f}', (10, 70), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-    
-    return result

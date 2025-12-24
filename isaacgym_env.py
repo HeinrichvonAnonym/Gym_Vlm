@@ -4,6 +4,9 @@ import numpy as np
 import torch
 from threading import Thread
 import time
+from tqdm import tqdm
+from utils.visualizer import visualize_masks_opencv
+import cv2
 
 class IsaacGymEnv:
     def __init__(self, cfg, args, task_args):
@@ -35,6 +38,22 @@ class IsaacGymEnv:
 
         self.main_thread = Thread(target=self.run)
         self.main_thread.start()
+
+    def _get_masks(self, text_prompt):
+        print("Generating masks...")
+        for idx in tqdm(range(self.latest_obs.cam_rgb.shape[0])):
+            rgb = self.latest_obs.cam_rgb[idx]
+            mask, valid_boxes, vadid_scores = self.task.get_obj_masks(rgb, text_prompt)
+            self.latest_obs.cam_masks[idx] = mask
+        
+        for idx in tqdm(range(self.latest_obs.cam_rgb.shape[0])):
+            result = visualize_masks_opencv(self.latest_obs.cam_masks[idx],
+                                             
+                                            self.latest_obs.cam_rgb[idx], idx)          
+            cv2.imshow(f"Masks_{idx}", result)
+            cv2.waitKey(1)
+    def get_masks(self, text_prompt):
+        self._get_masks(text_prompt)
 
     def get_object_names(self):
         return self.task.object_names  
@@ -90,20 +109,11 @@ class IsaacGymEnv:
         # need to mdify a osc executer
         # self.cur_action = action
         return self.task.vlm_obs, self.task.rew_buf, self.task.dones, self.task.extras
+    
     def render(self):
         self.task.render()
 
     def move_to_pose(self, pose, speed=None):
-        """
-        Moves the robot arm to a specific pose.
-
-        Args:
-            pose: The target pose.
-            speed: The speed at which to move the arm. Currently not implemented.
-
-        Returns:
-            tuple: A tuple containing the latest observations, reward, and termination flag.
-        """
         if self.latest_action is None:
             action = np.concatenate([pose, [self.init_obs.gripper_open]])
         else:
@@ -111,39 +121,18 @@ class IsaacGymEnv:
         return self.apply_action(action)
     
     def open_gripper(self):
-        """
-        Opens the gripper of the robot.
-        """
         action = np.concatenate([self.latest_obs.gripper_pose, [1.0]])
         return self.apply_action(action)
 
     def close_gripper(self):
-        """
-        Closes the gripper of the robot.
-        """
         action = np.concatenate([self.latest_obs.gripper_pose, [-1.0]])
         return self.apply_action(action)
 
     def set_gripper_state(self, gripper_state):
-        """
-        Sets the state of the gripper.
-
-        Args:
-            gripper_state: The target state for the gripper.
-
-        Returns:
-            tuple: A tuple containing the latest observations, reward, and termination flag.
-        """
         action = np.concatenate([self.latest_obs.gripper_pose, [gripper_state]])
         return self.apply_action(action)
 
     def reset_to_default_pose(self):
-        """
-        Resets the robot arm to its default pose.
-
-        Returns:
-            tuple: A tuple containing the latest observations, reward, and termination flag.
-        """
         if self.latest_action is None:
             action = np.concatenate([self.init_obs.gripper_pose, [self.init_obs.gripper_open]])
         else:
@@ -163,23 +152,12 @@ class IsaacGymEnv:
         return pose[3:7], pose[11:]
 
     def get_last_gripper_action(self):
-        """
-        Returns the last gripper action.
-
-        Returns:
-            float: The last gripper action.
-        """
         if self.latest_action is not None:
             return self.latest_action[-1]
         else:
             return self.init_obs.gripper_open
 
     def _reset_task_variables(self):
-        """
-        Resets variables related to the current task in the environment.
-
-        Note: This function is generally called internally.
-        """
         self.init_obs = None
         self.latest_obs = None
         self.latest_reward = None
@@ -200,18 +178,6 @@ class IsaacGymEnv:
         return obs
 
     def _process_action(self, input_action):
-        """
-        根据目标位姿计算OSC控制的action
-        
-        参数:
-            tar_pose: 目标位姿 [num_envs, 7] 或 [7]
-                    格式: [x, y, z, qx, qy, qz, qw]
-        
-        返回:
-            action: [num_envs, 6] 或 [6]
-                格式: [dx, dy, dz, droll, dpitch, dyaw] (轴角表示)
-        """
-
         input_action = input_action.reshape([-1, 8])
 
         if input_action.shape[0] > self.task.num_robots_per_env:

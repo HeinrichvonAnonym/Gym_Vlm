@@ -6,12 +6,13 @@ cam_height = 512
 
 class VLM_Observation():
     def __init__(self, num_robot = 1, num_cam = 2):
-        self.cam_rgb = np.zeros([num_cam, cam_width, cam_height, 3])  
+        self.cam_rgb = np.zeros([num_cam, cam_width, cam_height, 4])  
         self.cam_depth = np.zeros([num_cam, cam_width, cam_height])      
-        self.cam_mask = np.zeros([num_cam, cam_width, cam_height])  
+        self.cam_masks = [] 
         self.cam_point_cloud = []
         for i in range(num_cam):
-            self.cam_point_cloud.append([])                                                                                                                                                                                                                                                                                                                                                                  
+            self.cam_point_cloud.append([])   
+            self.cam_masks.append(None)                                                                                                                                                                                                                                                                                                                                                               
      
         self.joint_velocities = np.zeros([num_robot, 7])
         self.joint_positions = np.zeros([num_robot, 7])

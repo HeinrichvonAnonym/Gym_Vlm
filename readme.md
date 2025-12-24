@@ -15,7 +15,12 @@ implemente vlm based on isaacgym env
 ## install
 
 ### prepare
-install isaacgym and sam fisrtly, highly recommanded using python 3.8 
+1. install cuda recommand  11.7
+2. install torch recommand  1.13.1 + cuda 11.7 with python 3.8
+3. install isaacgym
+4. install sam and download pretrained model
+5. install groundingdino and download pretrained model
+6. download pretrained BERT model
 
 ### install packages
 ``` bash
