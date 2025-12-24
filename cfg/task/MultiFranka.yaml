@@ -127,8 +127,8 @@ env:
     - "tool"
     - "env"
 
-  workspaceBoundsMax: [2.5, 2.5, 5]
-  workspaceBoundsMin: [-2.5, -2.5, 0]
+  workspaceBoundsMax: [4, 4, 5]
+  workspaceBoundsMin: [-4, -4, 0]
 
 
 agent:
